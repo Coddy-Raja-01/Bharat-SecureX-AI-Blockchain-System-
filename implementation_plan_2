@@ -1,0 +1,152 @@
+# Implementation Plan — AI-Powered Criminal Network Analysis System (SIH26189)
+
+Targeted for Smart India Hackathon problem statement **SIH26189** (Ministry of Home Affairs / NCRB, Women Safety Division). Ingests multi-source, mixed structured/unstructured case data (FIR text, surveillance reports, social media intel, CDRs, financial transactions), extracts entities, normalizes and builds a relationship graph, ranks key individuals with explainable rationales, flags ML/rule-based anomalies, and visualizes everything via an investigator-facing dashboard with network graph, temporal heatmap, geographic hotspot map, and co-occurrence matrix.
+
+---
+
+## User Review Required
+
+> [!IMPORTANT]
+> - **Synthetic / Demo Data**: In strict accordance with the hackathon rules and problem statement guidelines, all data generated and bundled is synthetic demo data and clearly labeled as such in the UI.
+> - **Graph Processing Engine**: Following §1 fallback specification, NetworkX in-memory is utilized on the FastAPI backend for fast, deterministic sub-second calculation of PageRank, Betweenness Centrality, and Louvain Community Detection, avoiding heavy Neo4j JVM startup overhead and guaranteeing instant sub-3-second load times during judging.
+> - **Pre-cached Demo Mode**: The bundled sample dataset (PDF, CSV, XLSX) is pre-parsed and cached on application startup so clicking "Load Sample Case" populates the entire dashboard in under 1 second.
+
+---
+
+## Proposed Changes
+
+### 1. Sample Data Generation (`/sample_data`)
+
+Create realistic, cross-linked synthetic case files matching §7:
+- **`sample_unstructured_reports.pdf`**: Multi-page PDF generated via ReportLab containing:
+  - 3 FIRs (Cyber Crime PS Delhi FIR 104/2026, Sector 18 Noida FIR 88/2026, Gomti Nagar Lucknow FIR 212/2026)
+  - 1 Surveillance Intercept Report (SR-409 detailing meetings at Connaught Place)
+  - 1 Social Media Intel Note (SM-88 detailing burner numbers and transit links)
+- **`sample_cdr_data.csv`**: 16 Call Detail Records with caller/receiver number, name, timestamp, duration_sec, tower_location (Delhi, Noida, Lucknow, Gurugram, Kolkata, Mumbai), featuring deliberate 2-4 AM odd-hour calls.
+- **`sample_financial_transactions.xlsx`**: 15 financial transactions with txn_id, from/to accounts and names, amount, payment mode (RTGS, IMPS, UPI, CASH), date, remarks (including rapid structured transfers and cash withdrawals).
+- Shared cross-linked entities across all 3 files: *Vikram Singh* (+919876543210, DL-01-AB-1234), *Amit Sharma* (+919811122334), *Sunita Rao* (+919822233445), *Dinesh Verma* (+919833344556), *Rajan Malhotra*, *Neha Saxena*, *Priya Kapoor*, *Kabir Khan*, vehicle UP-32-CD-5678.
+
+---
+
+### 2. Backend Implementation (`/backend/app`)
+
+#### [NEW] [schemas.py](file:///d:/Development%20(Projects)/SIH%20Project%201/backend/app/models/schemas.py)
+Pydantic contracts strictly matching §6:
+- `NodeSchema`: id, label, type, centrality_score, community_id, risk_flag, attributes
+- `EdgeSchema`: id, source, target, type, weight, last_seen, evidence_ref, attributes
+- `AnomalySchema`: id, entity_ids, description, severity, evidence_refs, attributes
+- `KeyIndividualSchema`: id, label, type, centrality_score, pagerank, betweenness, community_id, rationale, risk_flag
+- `HeatmapPointSchema`: day, hour, count
+- `GeoPointSchema`: lat, lng, weight, location_name
+- `ExtractionPreviewResponse`: extracted nodes & edges with confidence scores for confirmation before ingestion
+- `CaseSummaryResponse`: full case payload with all graph, anomaly, and heatmap analytics
+
+#### [NEW] [ner.py](file:///d:/Development%20(Projects)/SIH%20Project%201/backend/app/pipeline/ner.py)
+- spaCy `en_core_web_sm` pipeline with custom `EntityRuler` and regex patterns:
+  - Phone numbers: `r'\+?91?[6-9]\d{9}'`
+  - Indian vehicle registration plates: `r'[A-Z]{2}-\d{2}-[A-Z]{2}-\d{4}'`
+  - Monetary values: `r'(?:Rs\.?|INR|₹)\s?[\d,]+(?:\.\d+)?'`
+  - Standard entity types: `PERSON`, `ORG`, `GPE`, `PHONE`, `VEHICLE`
+  - Multilingual script check (detecting Devanagari or regional UTF-8 text to flag "regional-language content detected").
+
+#### [NEW] [resolve_entities.py](file:///d:/Development%20(Projects)/SIH%20Project%201/backend/app/pipeline/resolve_entities.py)
+- `rapidfuzz.fuzz.token_sort_ratio` for fuzzy name matching (resolving "Amit Sharma" / "A. Sharma", "Vikram Singh" / "V. Singh").
+- Phone number canonicalization to E.164-style `+91XXXXXXXXXX`.
+- Vehicle plate normalization to uppercase with consistent hyphenation.
+
+#### [NEW] [parse_pdf.py](file:///d:/Development%20(Projects)/SIH%20Project%201/backend/app/pipeline/parse_pdf.py)
+- `pdfplumber` page-by-page text extraction.
+- Maps each document/page into a Document node (`doc_fir_104`, `doc_sr_409`), extracting entities and creating `MENTIONED_IN` edges with text excerpts and page references.
+
+#### [NEW] [parse_cdr.py](file:///d:/Development%20(Projects)/SIH%20Project%201/backend/app/pipeline/parse_cdr.py)
+- `pandas` CSV reader for CDR logs.
+- Generates `CALLED` edges between Person/Phone nodes with timestamp, duration, tower location, and unique evidence reference (`CDR-xxxx`).
+
+#### [NEW] [parse_txn.py](file:///d:/Development%20(Projects)/SIH%20Project%201/backend/app/pipeline/parse_txn.py)
+- `pandas` Excel reader for XLSX transaction files.
+- Generates `PAID` edges with amount, mode, date, remarks, and evidence reference (`TXN-xxxx`).
+
+#### [NEW] [centrality.py](file:///d:/Development%20(Projects)/SIH%20Project%201/backend/app/analytics/centrality.py)
+- Computes `nx.pagerank` and `nx.betweenness_centrality`.
+- Generates combined composite centrality score (0.0–1.0) and generates human-readable one-line rationales for the Key Individuals panel.
+
+#### [NEW] [community.py](file:///d:/Development%20(Projects)/SIH%20Project%201/backend/app/analytics/community.py)
+- Computes `nx.community.louvain_communities` to assign modular cluster/cell IDs.
+
+#### [NEW] [anomaly.py](file:///d:/Development%20(Projects)/SIH%20Project%201/backend/app/analytics/anomaly.py)
+- Trains `IsolationForest` on transaction amount, frequency, duration, and hour features.
+- Applies rule-based detectors (e.g. odd-hour calls between 01:00 and 04:00 AM, same-day cash withdrawals post high RTGS credit, structured rapid transactions).
+- Formats each anomaly with severity, affected entities, and clickable evidence references (`TXN-1002`, `CDR-0004`, `FIR-104`).
+
+#### [NEW] [heatmap_agg.py](file:///d:/Development%20(Projects)/SIH%20Project%201/backend/app/analytics/heatmap_agg.py)
+- Temporal heatmap aggregation: buckets timestamped edges into `(day_of_week, hour) -> count`.
+- Geographic heatmap aggregation: geocodes tower locations and FIR locations using a static Indian city lookup table -> `(lat, lng, weight, city)`.
+- Co-occurrence matrix: entity $\times$ entity combined interaction strength score normalized 0.0–1.0.
+- Chronological timeline events list filterable by entity.
+
+#### [NEW] [case_store.py](file:///d:/Development%20(Projects)/SIH%20Project%201/backend/app/case_store.py)
+- Central in-memory & SQLite-backed case manager storing case graphs, files, and precomputed analytics cache for sub-second responses.
+
+#### [MODIFY] [backend/app/main.py](file:///d:/Development%20(Projects)/SIH%20Project%201/backend/app/main.py)
+- Modular routers registration:
+  - `POST /api/cases/create` & `GET /api/cases`
+  - `POST /api/upload/preview` (Extracts entities & edges for user confirmation)
+  - `POST /api/upload/commit` (Commits confirmed extraction into active case graph)
+  - `POST /api/intel/paste` (Incrementally extracts & merges text snippet)
+  - `GET /api/cases/{case_id}/graph`
+  - `GET /api/cases/{case_id}/key-individuals`
+  - `GET /api/cases/{case_id}/anomalies`
+  - `GET /api/cases/{case_id}/heatmaps` (temporal + geo + co-occurrence)
+  - `GET /api/cases/{case_id}/timeline`
+  - `GET /api/cases/{case_id}/export-report`
+  - `POST /api/demo/load-sample` (Loads pre-cached sample case instantly in <1s)
+
+---
+
+### 3. Frontend Implementation (`/frontend/src`)
+
+Refactor and modularize into high-performance, polished components:
+- **`components/Navbar.tsx`**: Header with SIH26189 branding, MHA/NCRB division tag, synthetic data notice, Investigator vs Admin role toggle, search input, "Load Sample Case" button, and "Upload / Ingest Intel" button.
+- **`components/SummaryKpis.tsx`**: High-level counters (Total Entities, Relationships, Key Hubs, Flagged Anomalies, Louvain Clusters).
+- **`components/GraphView.tsx`**: `react-force-graph-2d` interactive network canvas:
+  - Node color = Entity Type (Person: Indigo/Purple, Org: Amber, Vehicle: Emerald, Location: Rose, Document: Sky).
+  - Node size = Centrality score (higher = larger node).
+  - Node border = Community ID color ring.
+  - Edge color = Relationship type (Call: Cyan, Transaction: Emerald, Mention: Gray dashed).
+  - Selection highlights, zoom-to-fit, node click side-panel inspection.
+- **`components/KeyIndividuals.tsx`**: Ranked list with centrality meters, community badges, risk indicators, and human-readable one-line rationales.
+- **`components/AnomalyList.tsx`**: Cards showing anomaly description, severity, and interactive evidence chips (`CDR-0009`, `TXN-1002`) that pan the graph to the relevant nodes.
+- **`components/SidePanel.tsx`**: Entity inspector showing attributes, connected relationships, and raw source excerpts.
+- **`components/TemporalHeatmap.tsx`**: 7-day $\times$ 24-hour activity grid heatmap highlighting peak operating hours (e.g. 1–3 AM syndicate call activity).
+- **`components/GeoHeatmap.tsx`**: Leaflet.js map with heatmap hotspot rendering and marker clusters across Delhi, NCR, Lucknow, Mumbai, Kolkata.
+- **`components/CooccurrenceMatrix.tsx`**: Interactive entity interaction strength matrix heatmap.
+- **`components/TimelineView.tsx`**: Chronological event stream filterable by entity.
+- **`components/ExtractionModal.tsx`**: Multi-file drag-and-drop uploader + "Paste Intel" textarea + **Extraction Confirmation Table** (letting investigators inspect pulled entities and relationships before committing to the graph).
+- **`components/CaseReportModal.tsx`**: One-click printable executive summary dossier for judges.
+
+---
+
+## Verification Plan
+
+### Automated Tests
+1. **Pipeline & Extraction Unit Test**:
+   - Run a test script to parse `sample_unstructured_reports.pdf`, `sample_cdr_data.csv`, and `sample_financial_transactions.xlsx`.
+   - Verify that PERSON, PHONE, VEHICLE, ORG entities are extracted.
+   - Verify that rapidfuzz resolves entity aliases.
+   - Verify that NetworkX computes PageRank, betweenness, and Louvain communities without errors.
+   - Verify that IsolationForest and rule-based checks flag the expected anomalies.
+2. **Backend API Endpoints Test**:
+   - Use `pytest` or `httpx` to verify all endpoints (`/api/demo/load-sample`, `/api/upload/preview`, `/api/cases/{case_id}/graph`, etc.) return 200 OK with the schemas specified in §6.
+
+### Manual Verification
+1. **One-Click Demo Test**:
+   - Click "Load Sample Case" button in the frontend. Verify that graph, key individuals, anomalies, temporal heatmap, and geo heatmap populate in under 2 seconds.
+2. **File Upload & Confirmation Test**:
+   - Upload sample files or paste raw text intel snippet in the Upload modal.
+   - Verify the "Extracted Entities Preview" table displays extracted records.
+   - Click "Confirm & Ingest" and verify graph and metrics update dynamically.
+3. **Graph & Heatmap Visual Inspection**:
+   - Verify force-graph drag, zoom, node selection, side panel detail with source excerpts.
+   - Verify temporal heatmap shows peak 1–3 AM activity.
+   - Verify Leaflet geo map renders hot spots in Delhi NCR, Lucknow, etc.
+   - Click evidence tags on anomalies to verify they highlight the corresponding nodes/edges.
